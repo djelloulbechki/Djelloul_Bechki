@@ -1,0 +1,151 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "authorship_tag": "ABX9TyO5OJY7EGujV8/JX1EeG3zN",
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/djelloulbechki/Djelloul_Bechki/blob/master/Aetheris_Developement\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Database Schema Code"
+      ],
+      "metadata": {
+        "id": "RJ0heEVP0Fqm"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "-- Enable UUID extension\n",
+        "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";\n",
+        "\n",
+        "-- 1. Create the Projects Table\n",
+        "CREATE TABLE projects (\n",
+        "    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n",
+        "    project_name TEXT NOT NULL,\n",
+        "    location TEXT,\n",
+        "    total_budget DECIMAL(15, 2) CHECK (total_budget >= 0),\n",
+        "    construction_progress_percent DECIMAL(5, 2) DEFAULT 0 CHECK (construction_progress_percent BETWEEN 0 AND 100),\n",
+        "    start_date DATE,\n",
+        "    expected_completion_date DATE,\n",
+        "    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n",
+        "    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n",
+        ");\n",
+        "\n",
+        "-- 2. Create the Units Table (Inventory)\n",
+        "CREATE TABLE units (\n",
+        "    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n",
+        "    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,\n",
+        "    unit_number TEXT NOT NULL,\n",
+        "    unit_type TEXT, -- e.g., '1BR', 'Penthouse'\n",
+        "    floor_number INTEGER,\n",
+        "    price DECIMAL(15, 2) NOT NULL CHECK (price > 0),\n",
+        "    is_sold BOOLEAN DEFAULT FALSE,\n",
+        "    sold_date DATE,\n",
+        "    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n",
+        "    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n",
+        "    UNIQUE(project_id, unit_number) -- Trick: Prevents duplicate unit numbers in the same tower\n",
+        ");\n",
+        "\n",
+        "-- 3. Create the Escrow Table\n",
+        "-- (Created before Ledger so Ledger can reference it if needed)\n",
+        "CREATE TABLE escrow (\n",
+        "    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n",
+        "    project_id UUID UNIQUE REFERENCES projects(id) ON DELETE CASCADE, -- Trick: One escrow account per project\n",
+        "    bank_name TEXT DEFAULT 'Emirates NBD',\n",
+        "    account_number TEXT UNIQUE NOT NULL,\n",
+        "    bank_balance DECIMAL(15, 2) DEFAULT 0,\n",
+        "    locked_amount DECIMAL(15, 2) DEFAULT 0,\n",
+        "    last_audit_date DATE,\n",
+        "    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n",
+        "    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n",
+        ");\n",
+        "\n",
+        "-- 4. Create the Ledger Table (Cash Flow)\n",
+        "CREATE TABLE ledger (\n",
+        "    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n",
+        "    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,\n",
+        "    transaction_type TEXT CHECK (transaction_type IN ('INFLOW', 'OUTFLOW')),\n",
+        "    amount DECIMAL(15, 2) NOT NULL CHECK (amount <> 0),\n",
+        "    description TEXT,\n",
+        "    reference_id UUID, -- Can link to a specific Unit ID\n",
+        "    is_escrow_related BOOLEAN DEFAULT FALSE,\n",
+        "    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n",
+        ");\n",
+        "\n",
+        "--- PERFORMANCE INDEXES ---\n",
+        "CREATE INDEX idx_projects_name ON projects(project_name);\n",
+        "CREATE INDEX idx_units_project_status ON units(project_id, is_sold); -- Compound index for fast inventory checks\n",
+        "CREATE INDEX idx_ledger_project_date ON ledger(project_id, created_at); -- Compound index for fast financial reports\n",
+        "CREATE INDEX idx_escrow_project ON escrow(project_id);\n",
+        "\n",
+        "--- AUTOMATION TRIGGERS ---\n",
+        "\n",
+        "-- A. Auto-update 'updated_at' timestamp function\n",
+        "CREATE OR REPLACE FUNCTION update_timestamp()\n",
+        "RETURNS TRIGGER AS $$\n",
+        "BEGIN\n",
+        "    NEW.updated_at = NOW();\n",
+        "    RETURN NEW;\n",
+        "END;\n",
+        "$$ LANGUAGE plpgsql;\n",
+        "\n",
+        "CREATE TRIGGER trig_update_projects BEFORE UPDATE ON projects FOR EACH ROW EXECUTE FUNCTION update_timestamp();\n",
+        "CREATE TRIGGER trig_update_units BEFORE UPDATE ON units FOR EACH ROW EXECUTE FUNCTION update_timestamp();\n",
+        "CREATE TRIGGER trig_update_escrow BEFORE UPDATE ON escrow FOR EACH ROW EXECUTE FUNCTION update_timestamp();\n",
+        "\n",
+        "-- B. Auto-sync Escrow Balance from Ledger\n",
+        "CREATE OR REPLACE FUNCTION sync_escrow_from_ledger()\n",
+        "RETURNS TRIGGER AS $$\n",
+        "BEGIN\n",
+        "    IF NEW.is_escrow_related THEN\n",
+        "        IF NEW.transaction_type = 'INFLOW' THEN\n",
+        "            UPDATE escrow\n",
+        "            SET bank_balance = bank_balance + NEW.amount,\n",
+        "                locked_amount = locked_amount + NEW.amount\n",
+        "            WHERE project_id = NEW.project_id;\n",
+        "        ELSIF NEW.transaction_type = 'OUTFLOW' THEN\n",
+        "            UPDATE escrow\n",
+        "            SET bank_balance = bank_balance - NEW.amount,\n",
+        "                locked_amount = locked_amount - NEW.amount\n",
+        "            WHERE project_id = NEW.project_id;\n",
+        "        END IF;\n",
+        "    END IF;\n",
+        "    RETURN NEW;\n",
+        "END;\n",
+        "$$ LANGUAGE plpgsql;\n",
+        "\n",
+        "CREATE TRIGGER trig_ledger_to_escrow_sync\n",
+        "AFTER INSERT ON ledger\n",
+        "FOR EACH ROW EXECUTE FUNCTION sync_escrow_from_ledger();"
+      ],
+      "metadata": {
+        "id": "Nrj-zH-h0KKv"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
